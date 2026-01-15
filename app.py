@@ -34,7 +34,7 @@ import streamlit as st
 # - Pay Type: "Salaried" matches "Salary" (hourly/salaried buckets)
 # =========================================================
 
-APP_TITLE = "Paycom Uzio Census Comparitor Tool"
+APP_TITLE = "Paycom Uzio Census Audit Tool"
 
 UZIO_SHEET = "Uzio Data"
 PAYCOM_SHEET = "Paycom Data"
