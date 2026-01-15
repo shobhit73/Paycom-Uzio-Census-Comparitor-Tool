@@ -193,9 +193,9 @@ def read_mapping_sheet(xls: pd.ExcelFile, sheet_name: str) -> pd.DataFrame:
 
     # exclude Employee ID row from comparisons (it is only key)
     m["_uz_norm"] = m["UZIO_Column"].map(lambda x: norm_colname(x).casefold())
-    m = m[m["_uz_norm"] not in ["employee id"]].copy() if len(m) else m
-    if "_uz_norm" in m.columns:
-        m.drop(columns=["_uz_norm"], inplace=True, errors="ignore")
+    # ✅ FIX HERE (this was causing "truth value of a Series is ambiguous")
+    m = m[m["_uz_norm"] != "employee id"].copy()
+    m.drop(columns=["_uz_norm"], inplace=True, errors="ignore")
 
     return m
 
@@ -258,7 +258,7 @@ def norm_value(x, field_name: str):
         s = re.sub(r"\s+", " ", str(x).strip()).casefold()
         return PAYTYPE_SYNONYMS.get(s, s)
 
-    # Employment Status (CHANGE): Paycom "On Leave" == Uzio "Active"
+    # Employment Status: Paycom "On Leave" == Uzio "Active"
     if any(k in f for k in EMP_STATUS_KEYWORDS):
         s = re.sub(r"\s+", " ", str(x).strip()).casefold()
         if s == "on leave":
@@ -282,7 +282,6 @@ def key_series(s: pd.Series) -> pd.Series:
     return s2.map(_fix)
 
 # Termination Reason mapping (Paycom -> allowed Uzio values)
-# (kept flexible: if Paycom value matches, Uzio can be any allowed value)
 TERM_REASON_ALLOWED = {
     "attendance violation": {"other"},
     "employee elected not to return": {"other"},
@@ -313,15 +312,12 @@ def termination_reason_ok(uz_raw, pc_raw) -> bool:
     if uz == "" and pc == "":
         return True
 
-    # If both contain "voluntary" (and not "involuntary"), OK
     if "voluntary" in uz and "voluntary" in pc and ("involuntary" not in uz) and ("involuntary" not in pc):
         return True
 
-    # If both contain "involuntary", OK
     if "involuntary" in uz and "involuntary" in pc:
         return True
 
-    # Mapping table (Paycom -> allowed Uzio)
     allowed = TERM_REASON_ALLOWED.get(pc, None)
     if allowed is not None:
         return uz in allowed
@@ -329,7 +325,6 @@ def termination_reason_ok(uz_raw, pc_raw) -> bool:
     return False
 
 def get_pay_type_for_employee(emp_id: str, uzio_df: pd.DataFrame, paycom_df: pd.DataFrame, uz_key: str, pc_key: str):
-    # Prefer UZIO Pay Type
     uz_pay_col = find_col(uzio_df.columns, "Pay Type")
     if uz_pay_col and emp_id in uzio_df.index:
         v = uzio_df.loc[emp_id, uz_pay_col]
@@ -339,7 +334,6 @@ def get_pay_type_for_employee(emp_id: str, uzio_df: pd.DataFrame, paycom_df: pd.
         if s:
             return PAYTYPE_SYNONYMS.get(s, s)
 
-    # Fallback Paycom Pay Type
     pc_pay_col = find_col(paycom_df.columns, "Pay Type")
     if pc_pay_col and emp_id in paycom_df.index:
         v = paycom_df.loc[emp_id, pc_pay_col]
@@ -352,10 +346,6 @@ def get_pay_type_for_employee(emp_id: str, uzio_df: pd.DataFrame, paycom_df: pd.
     return ""
 
 def should_skip_field_for_employee(field_name: str, pay_type_norm: str) -> bool:
-    """
-    Existing behavior requested earlier:
-      - If person is salaried, don't compare their hourly rate.
-    """
     f = norm_colname(field_name).casefold()
     if pay_type_norm == "salaried":
         if "hourly rate" in f or ("rate" in f and "hour" in f):
@@ -374,7 +364,6 @@ def build_report(file_bytes: bytes) -> bytes:
     uzio.columns = [norm_colname(c) for c in uzio.columns]
     paycom.columns = [norm_colname(c) for c in paycom.columns]
 
-    # Key columns
     uz_key = find_col(uzio.columns, "Employee ID", "Employee", "EmployeeID", "Emp ID")
     pc_key = find_col(paycom.columns, "Employee ID", "Employee", "EmployeeID", "Emp ID")
     if uz_key is None:
@@ -382,11 +371,9 @@ def build_report(file_bytes: bytes) -> bytes:
     if pc_key is None:
         raise ValueError("Paycom key column not found (expected 'Employee ID' or 'Employee') in 'Paycom Data'.")
 
-    # Normalize keys
     uzio[uz_key] = key_series(uzio[uz_key])
     paycom[pc_key] = key_series(paycom[pc_key])
 
-    # Index by Employee (keep first if duplicates)
     uzio_idx = uzio.dropna(subset=[uz_key]).copy()
     paycom_idx = paycom.dropna(subset=[pc_key]).copy()
     uzio_idx = uzio_idx[uzio_idx[uz_key].map(norm_blank) != ""]
@@ -395,10 +382,8 @@ def build_report(file_bytes: bytes) -> bytes:
     uzio_idx = uzio_idx.groupby(uz_key, as_index=False).first().set_index(uz_key, drop=False)
     paycom_idx = paycom_idx.groupby(pc_key, as_index=False).first().set_index(pc_key, drop=False)
 
-    # (CHANGE 1) Build UZIO Employment Status map (mandatory in UZIO)
     uz_emp_status_col = find_col(uzio_idx.columns, "Employment Status")
     if uz_emp_status_col is None:
-        # Still allow tool to run, but column will be blank
         uz_emp_status_map = {}
     else:
         uz_emp_status_map = (
@@ -409,7 +394,6 @@ def build_report(file_bytes: bytes) -> bytes:
             .to_dict()
         )
 
-    # Mapping sanity: columns must exist
     def _col_exists(df_cols, col_name):
         return norm_colname(col_name).casefold() in {norm_colname(c).casefold() for c in df_cols}
 
@@ -419,7 +403,6 @@ def build_report(file_bytes: bytes) -> bytes:
     for emp in all_emps:
         emp = "" if norm_blank(emp) == "" else str(emp).strip()
 
-        # Pay type for skip rules (kept as earlier requirement)
         pay_type_norm = get_pay_type_for_employee(emp, uzio_idx, paycom_idx, uz_key, pc_key)
 
         for _, m in mapping.iterrows():
@@ -437,7 +420,6 @@ def build_report(file_bytes: bytes) -> bytes:
             if emp in paycom_idx.index and pc_exists:
                 pc_val = paycom_idx.loc[emp, pc_col]
 
-            # Determine status (keep same structure)
             if emp not in paycom_idx.index and emp in uzio_idx.index:
                 status = "MISSING_IN_PAYCOM"
             elif emp in paycom_idx.index and emp not in uzio_idx.index:
@@ -447,11 +429,9 @@ def build_report(file_bytes: bytes) -> bytes:
             elif not uz_exists:
                 status = "UZIO_COLUMN_MISSING"
             else:
-                # Skip rule: salaried -> don't compare hourly rate
                 if should_skip_field_for_employee(field, pay_type_norm):
                     status = "OK"
                 else:
-                    # Special-case: Termination Reason rules
                     f_norm = norm_colname(field).casefold()
                     if any(k in f_norm for k in TERMINATION_REASON_KEYWORDS):
                         if termination_reason_ok(uz_val, pc_val):
@@ -479,12 +459,11 @@ def build_report(file_bytes: bytes) -> bytes:
                         else:
                             status = "MISMATCH"
 
-            # (CHANGE 1) Add Employment Status column after Field (always from UZIO)
             rows.append(
                 {
                     "Employee": emp,
                     "Field": field,
-                    "Employment Status": uz_emp_status_map.get(emp, ""),  # context column
+                    "Employment Status": uz_emp_status_map.get(emp, ""),
                     "UZIO_Value": uz_val,
                     "PAYCOM_Value": pc_val,
                     "PAYCOM_SourceOfTruth_Status": status,
@@ -496,14 +475,13 @@ def build_report(file_bytes: bytes) -> bytes:
         columns=[
             "Employee",
             "Field",
-            "Employment Status",  # (CHANGE 1) column position enforced here
+            "Employment Status",
             "UZIO_Value",
             "PAYCOM_Value",
             "PAYCOM_SourceOfTruth_Status",
         ],
     )
 
-    # Field summary
     statuses = [
         "OK",
         "MISMATCH",
@@ -531,7 +509,6 @@ def build_report(file_bytes: bytes) -> bytes:
     else:
         field_summary_by_status = pd.DataFrame(columns=["Field"] + statuses + ["Total"])
 
-    # Summary
     uzio_emp = set(uzio_idx.index.tolist())
     paycom_emp = set(paycom_idx.index.tolist())
     fields_compared = int(mapping.shape[0])
