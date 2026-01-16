@@ -1,500 +1,630 @@
+# app.py
 import io
 import re
-from datetime import datetime
-from decimal import Decimal, InvalidOperation
+from datetime import datetime, date
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
+# =========================================================
+# Paycom vs UZIO – Census Audit Tool
+# INPUT workbook tabs (single file):
+#   - Uzio Data
+#   - Paycom Data
+#   - Mapping Sheet   (UZIO Column -> Paycom Column)
+#
+# OUTPUT workbook tabs:
+#   - Summary
+#   - Field_Summary_By_Status
+#   - Comparison_Detail_AllFields
+#
+# Key rules included:
+#   ✅ Dates compare as DATE (ignore time part)
+#   ✅ Termination Reason: voluntary/involuntary keyword logic + UZIO=Other => OK
+#   ✅ Pay Type: UZIO "Salaried" == Paycom "Salary" => OK
+#   ✅ Suffix: Jr. == JR => OK
+#   ✅ Employment Type: Full Time == Full-Time => OK
+#   ✅ Middle initial: UZIO first letter matches Paycom full middle name => OK
+#   ✅ Employment Status: Paycom "On Leave" treated as "Active" => OK
+#   ✅ Numerics: 150000.00 == 150000, 80.0 == 80 => OK (tolerance compare)
+#
+# Pay Type driven ignores (IMPORTANT):
+#   ✅ If employee is HOURLY: ignore Annual Salary fields (UZIO blank is OK)
+#   ✅ If employee is SALARIED: ignore Hourly Pay Rate AND Working Hours per Week
+#      (UZIO leaves these blank => should be OK, not UZIO_MISSING_VALUE)
+#
+# Adds extra output column: "Employment Status" right after "Field"
+# =========================================================
 
-# =========================
-# CONFIG
-# =========================
 APP_TITLE = "Paycom Uzio Census Audit Tool"
 
-UZIO_SHEET_NAME = "Uzio Data"
-PAYCOM_SHEET_NAME = "Paycom Data"
-MAPPING_SHEET_NAME = "Mapping Sheet"
+UZIO_SHEET_CANDIDATES = ["Uzio Data", "UZIO Data", "Uzio", "UZIO"]
+PAYCOM_SHEET_CANDIDATES = ["Paycom Data", "PAYCOM Data", "Paycom", "PAYCOM"]
+MAP_SHEET_CANDIDATES = ["Mapping Sheet", "Mapping", "Mapping_Sheet", "MappingSheet"]
 
-DETAIL_SHEET = "Comparison_Detail_AllFields"
-SUMMARY_SHEET = "Summary"
-FIELD_SUMMARY_SHEET = "Field_Summary_By_Status"
+# ---------- UI ----------
+st.set_page_config(page_title=APP_TITLE, layout="centered", initial_sidebar_state="collapsed")
+st.markdown(
+    """
+    <style>
+      [data-testid="stSidebar"] { display: none !important; }
+      [data-testid="collapsedControl"] { display: none !important; }
+      header { display: none !important; }
+      footer { display: none !important; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-
-# =========================
-# UI
-# =========================
-st.set_page_config(page_title=APP_TITLE, layout="centered")
-st.title(APP_TITLE)
-st.write("Upload the Excel workbook (.xlsx) with 3 tabs: Uzio Data, Paycom Data, and Mapping Sheet.")
-
-
-# =========================
-# HELPERS
-# =========================
-def norm_colname(c) -> str:
+# ---------- Helpers ----------
+def norm_colname(c: str) -> str:
     if c is None:
         return ""
-    s = str(c).replace("\n", " ").replace("\r", " ").replace("\u00A0", " ")
+    c = str(c).replace("\n", " ").replace("\r", " ")
+    c = c.replace("\u00A0", " ")
+    c = c.replace("’", "'").replace("“", '"').replace("”", '"')
+    c = re.sub(r"\s+", " ", c).strip()
+    c = c.replace("*", "")
+    c = c.strip('"').strip("'")
+    return c
+
+def norm_blank(x):
+    if x is None:
+        return ""
+    if isinstance(x, float) and np.isnan(x):
+        return ""
+    if isinstance(x, str) and x.strip().lower() in {"", "nan", "none", "null"}:
+        return ""
+    return x
+
+def find_col(df_cols, *candidate_names):
+    norm_map = {norm_colname(c).casefold(): c for c in df_cols}
+    for cand in candidate_names:
+        key = norm_colname(cand).casefold()
+        if key in norm_map:
+            return norm_map[key]
+    return None
+
+def norm_key_series(s: pd.Series) -> pd.Series:
+    s2 = s.astype(object).where(~s.isna(), "")
+    def _fix(v):
+        v = str(v).strip()
+        v = v.replace("\u00A0", " ")
+        if re.fullmatch(r"\d+\.0+", v):
+            v = v.split(".")[0]
+        return v
+    return s2.map(_fix)
+
+def try_parse_date(x):
+    x = norm_blank(x)
+    if x == "":
+        return ""
+    if isinstance(x, (datetime, date, np.datetime64, pd.Timestamp)):
+        return pd.to_datetime(x).date().isoformat()
+    if isinstance(x, str):
+        s = x.strip()
+        try:
+            return pd.to_datetime(s, errors="raise").date().isoformat()
+        except Exception:
+            return s
+    return str(x)
+
+def as_float_or_none(x):
+    x = norm_blank(x)
+    if x == "":
+        return None
+    if isinstance(x, (int, float, np.integer, np.floating)):
+        try:
+            return float(x)
+        except Exception:
+            return None
+    if isinstance(x, str):
+        s = x.strip().replace(",", "").replace("$", "")
+        if s == "":
+            return None
+        try:
+            return float(s)
+        except Exception:
+            return None
+    return None
+
+def normalize_space_and_case(x):
+    x = norm_blank(x)
+    if x == "":
+        return ""
+    s = str(x).strip()
+    s = s.replace("\u00A0", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s.casefold()
+
+def normalize_employment_type(x):
+    s = normalize_space_and_case(x)
+    s = s.replace("-", " ")
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-
-def is_blank(x) -> bool:
-    if x is None:
-        return True
-    if isinstance(x, float) and np.isnan(x):
-        return True
-    s = str(x).strip()
-    return s == "" or s.lower() in {"nan", "null", "none"}
-
-
-def to_str(x) -> str:
-    if is_blank(x):
-        return ""
-    return str(x).strip()
-
-
-def norm_key_series(s: pd.Series) -> pd.Series:
-    # Handles excel numbers like 123.0
-    return s.astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
-
-
-def digits_only(x: str) -> str:
-    return re.sub(r"\D", "", to_str(x))
-
-
-def norm_phone(x) -> str:
-    d = digits_only(x)
-    # Paycom sometimes includes country code "1"
-    if len(d) == 11 and d.startswith("1"):
-        d = d[1:]
-    # compare last 10 digits
-    return d[-10:] if len(d) >= 10 else d
-
-
-def norm_zip(x) -> str:
-    d = digits_only(x)
-    return d[:5]
-
-
-def try_decimal(x):
-    s = to_str(x)
-    if s == "":
-        return None
-    s = s.replace(",", "")
-    try:
-        d = Decimal(s)
-        # normalize to remove trailing zeros (150000.00 == 150000)
-        return d.normalize()
-    except (InvalidOperation, ValueError):
-        return None
-
-
-def num_equal(a, b) -> bool:
-    da = try_decimal(a)
-    db = try_decimal(b)
-    if da is None or db is None:
-        return False
-    return da == db
-
-
-def norm_simple_text(x: str) -> str:
-    # normalize for comparisons like Full-Time vs Full Time, Jr. vs JR
-    s = to_str(x).casefold()
-    s = s.replace(".", "")
-    s = re.sub(r"[\s\-]+", "", s)  # remove spaces + hyphens
+def normalize_suffix(x):
+    s = normalize_space_and_case(x)
+    s = re.sub(r"[^a-z0-9]", "", s)  # remove punctuation/spaces
     return s
 
+def first_alpha_char(x):
+    s = norm_blank(x)
+    if s == "":
+        return ""
+    txt = str(s).strip()
+    m = re.search(r"[A-Za-z]", txt)
+    return m.group(0).casefold() if m else ""
 
-def contains_word(haystack: str, needle: str) -> bool:
-    return needle.casefold() in to_str(haystack).casefold()
+def normalize_middle_initial(uzio_val, paycom_val):
+    # UZIO has 'M', Paycom has 'MICHELLE' => OK if first letter matches
+    u = first_alpha_char(uzio_val)
+    p = first_alpha_char(paycom_val)
+    return u != "" and p != "" and u == p
 
+def canonical_pay_type(x):
+    s = normalize_space_and_case(x)
+    if s == "":
+        return ""
+    if "hour" in s:
+        return "hourly"
+    if "salar" in s or "salary" in s:
+        return "salaried"
+    return s
 
-def find_sheet_case_insensitive(xls: pd.ExcelFile, expected: str) -> str:
-    # Allow exact match OR case-insensitive match
-    for s in xls.sheet_names:
-        if s == expected:
-            return s
-    for s in xls.sheet_names:
-        if s.casefold() == expected.casefold():
-            return s
-    raise ValueError(f"Sheet not found: '{expected}'. Available: {xls.sheet_names}")
+def canonical_employment_status(x):
+    # Paycom "On Leave" treated as "Active"
+    s = normalize_space_and_case(x)
+    if s == "":
+        return ""
+    if "on leave" in s:
+        return "active"
+    if s in {"active", "activated"}:
+        return "active"
+    return s
 
+def termination_reason_equal(uzio_val, paycom_val):
+    uz = normalize_space_and_case(uzio_val)
+    pc = normalize_space_and_case(paycom_val)
 
-def choose_key_column(cols, preferred_list):
-    cols_cf = {c.casefold(): c for c in cols}
-    for p in preferred_list:
-        if p.casefold() in cols_cf:
-            return cols_cf[p.casefold()]
-    # fallback: any column containing "employee"
-    for c in cols:
-        if "employee" in c.casefold():
-            return c
+    if uz == "" and pc == "":
+        return True
+
+    # UZIO "Other" is acceptable for any Paycom reason
+    if uz == "other":
+        return True
+
+    # If either has involuntary, both must have involuntary
+    if ("involuntary" in uz) or ("involuntary" in pc):
+        return ("involuntary" in uz) and ("involuntary" in pc)
+
+    # If either has voluntary, both must have voluntary
+    if ("voluntary" in uz) or ("voluntary" in pc):
+        return ("voluntary" in uz) and ("voluntary" in pc)
+
+    return uz == pc
+
+def resolve_sheet_name(xls: pd.ExcelFile, candidates):
+    existing_norm = {norm_colname(s).casefold(): s for s in xls.sheet_names}
+    for c in candidates:
+        k = norm_colname(c).casefold()
+        if k in existing_norm:
+            return existing_norm[k]
     return None
 
+def resolve_paycom_col_label(label: str, paycom_cols_all) -> str:
+    if label is None:
+        return ""
+    raw = str(label).strip()
+    raw = raw.replace("’", "'").replace("“", '"').replace("”", '"')
+    raw = raw.strip().strip(",")
+    if raw == "":
+        return ""
 
-# =========================
-# MAPPING SHEET READERS
-# =========================
-def read_column_mapping(mapping_df: pd.DataFrame, uz_cols, pc_cols):
-    """
-    Expects two columns in mapping sheet for field mapping:
-      - UZIO Column
-      - Paycom Column
-    (case-insensitive)
-    """
-    m = mapping_df.copy()
+    pay_norm = {norm_colname(c).casefold(): c for c in paycom_cols_all}
+
+    direct = norm_colname(raw).casefold()
+    if direct in pay_norm:
+        return pay_norm[direct]
+
+    parts = re.split(r"\(|\)|\bor\b|/|,|;", raw, flags=re.IGNORECASE)
+    parts = [norm_colname(p) for p in parts if norm_colname(p)]
+
+    extra = []
+    for p in parts:
+        extra.extend([norm_colname(x) for x in re.split(r"\s[-–]\s", p) if norm_colname(x)])
+    parts = parts + extra
+
+    for p in parts:
+        k = norm_colname(p).casefold()
+        if k in pay_norm:
+            return pay_norm[k]
+
+    for k_norm, actual in pay_norm.items():
+        if k_norm and (k_norm in direct or direct in k_norm):
+            return actual
+
+    return ""
+
+def read_mapping_sheet(xls: pd.ExcelFile, sheet_name: str, paycom_cols_all: list) -> pd.DataFrame:
+    m = pd.read_excel(xls, sheet_name=sheet_name, dtype=object)
     m.columns = [norm_colname(c) for c in m.columns]
 
-    # detect mapping header names
-    uz_header = None
-    pc_header = None
+    uz_col_name = None
+    pc_col_name = None
     for c in m.columns:
-        if c.casefold() == "uzio column":
-            uz_header = c
-        if c.casefold() == "paycom column":
-            pc_header = c
-    if uz_header is None or pc_header is None:
-        raise ValueError("Mapping Sheet must contain columns: 'UZIO Column' and 'Paycom Column'.")
+        if norm_colname(c).casefold() in {"uzio coloumn", "uzio column"}:
+            uz_col_name = c
+        if norm_colname(c).casefold() in {"paycom coloumn", "paycom column"}:
+            pc_col_name = c
 
-    m[uz_header] = m[uz_header].map(norm_colname)
-    m[pc_header] = m[pc_header].map(norm_colname)
+    if uz_col_name is None or pc_col_name is None:
+        raise ValueError(f"'{sheet_name}' must contain columns: 'UZIO Column' and 'Paycom Column'.")
 
-    # Remove key mappings (employee id etc.) from column mapping
-    m["_uz_norm"] = m[uz_header].str.casefold()
-    m = m[~m["_uz_norm"].isin(["employee", "employee id", "employee_code", "employee code"])].copy()
+    m[uz_col_name] = m[uz_col_name].map(norm_colname)
+    m[pc_col_name] = m[pc_col_name].map(norm_colname)
 
-    # resolve paycom column names to exact header in paycom sheet
-    pc_map = {c.casefold(): c for c in pc_cols}
-    m["PAYCOM_Resolved"] = m[pc_header].apply(lambda x: pc_map.get(to_str(x).casefold(), ""))
+    m = m.dropna(subset=[uz_col_name, pc_col_name]).copy()
+    m = m[(m[uz_col_name] != "") & (m[pc_col_name] != "")]
+    m = m.drop_duplicates(subset=[uz_col_name], keep="first").copy()
 
-    return m.rename(columns={uz_header: "UZIO Column", pc_header: "Paycom Column"})[["UZIO Column", "Paycom Column", "PAYCOM_Resolved"]]
+    m["UZIO_Column"] = m[uz_col_name]
+    m["PAYCOM_Label"] = m[pc_col_name]
+    m["PAYCOM_Resolved_Column"] = m["PAYCOM_Label"].map(lambda x: resolve_paycom_col_label(x, paycom_cols_all))
 
+    # exclude Employee ID/Employee Code from comparisons (key only)
+    m["_uz_norm"] = m["UZIO_Column"].map(lambda x: norm_colname(x).casefold())
+    m = m[~m["_uz_norm"].isin({"employee id", "employee", "employee_code", "employee code"})].copy()
+    m.drop(columns=["_uz_norm"], inplace=True)
 
-def read_value_mapping_table(mapping_df: pd.DataFrame, left_col_name: str, right_col_name: str):
+    return m
+
+def should_ignore_field_for_paytype(field_name: str, pay_type_canon: str) -> bool:
     """
-    Reads a 2-column mapping like:
-      Paycom Termination Reason | Uzio Termination Reason
-    Returns dict: normalized_paycom_value -> uzio_value (original)
+    Pay-type based ignore rules (as per your requirement):
+      - HOURLY employees: ignore annual salary fields
+      - SALARIED employees: ignore hourly pay rate AND working hours per week
     """
-    cols_cf = {c.casefold(): c for c in mapping_df.columns}
-    lc = cols_cf.get(left_col_name.casefold())
-    rc = cols_cf.get(right_col_name.casefold())
-    if lc is None or rc is None:
-        return {}
+    f = norm_colname(field_name).casefold()
+    pt = (pay_type_canon or "").casefold()
 
-    sub = mapping_df[[lc, rc]].copy()
-    sub = sub.dropna(how="all")
-    out = {}
-    for _, row in sub.iterrows():
-        k = to_str(row[lc])
-        v = to_str(row[rc])
-        if k != "" and v != "":
-            out[k.casefold()] = v
-    return out
+    if pt == "hourly":
+        if "annual salary" in f:
+            return True
 
+    if pt == "salaried":
+        # ignore Hourly Pay Rate (covers: "Hourly Pay Rate", "Hourly Rate", etc.)
+        if ("hourly" in f and "rate" in f):
+            return True
 
-# =========================
-# CORE COMPARISON RULES
-# =========================
-def compare_values(field, uz_val, pc_val, emp_pay_type, value_maps):
-    """
-    Returns one of:
-      OK, MISMATCH, UZIO_MISSING_VALUE, PAYCOM_MISSING_VALUE, UZIO_COLUMN_MISSING, PAYCOM_COLUMN_MISSING
-    """
-    f = to_str(field)
+        # ignore Working Hours per Week (covers: "Working Hours per Week(Digits)", "Hours per Week", etc.)
+        if ("hours per week" in f) or ("working hours" in f):
+            return True
 
-    # 1) Original DOH should never be considered mismatch
-    if f.casefold() == "original doh":
-        return "OK"
+    return False
 
-    # Standard missing checks
-    uz_blank = is_blank(uz_val)
-    pc_blank = is_blank(pc_val)
+def normalized_compare(field_name: str, uzio_val, paycom_val) -> bool:
+    f = norm_colname(field_name).casefold()
 
-    # If both blank -> OK
-    if uz_blank and pc_blank:
-        return "OK"
+    if "termination reason" in f:
+        return termination_reason_equal(uzio_val, paycom_val)
 
-    # =========================
-    # FIELD-SPECIFIC RULES
-    # =========================
-    fname = f.casefold()
+    if "employment status" in f:
+        return canonical_employment_status(uzio_val) == canonical_employment_status(paycom_val)
 
-    # Phone Number(Digits): ignore country code 1
-    if "phone number" in fname:
-        if uz_blank and not pc_blank:
-            # still mismatch? user wants ignore country code only, not missing.
-            # We'll treat missing as missing.
-            return "UZIO_MISSING_VALUE"
-        if pc_blank and not uz_blank:
-            return "PAYCOM_MISSING_VALUE"
-        return "OK" if norm_phone(uz_val) == norm_phone(pc_val) else "MISMATCH"
+    if "pay type" in f:
+        return canonical_pay_type(uzio_val) == canonical_pay_type(paycom_val)
 
-    # Zipcode: first 5 digits must match
-    if "zipcode" in fname:
-        if uz_blank and not pc_blank:
-            return "UZIO_MISSING_VALUE"
-        if pc_blank and not uz_blank:
-            return "PAYCOM_MISSING_VALUE"
-        return "OK" if norm_zip(uz_val) == norm_zip(pc_val) else "MISMATCH"
+    if "employment type" in f:
+        return normalize_employment_type(uzio_val) == normalize_employment_type(paycom_val)
 
-    # Employee Middle Initial: UZIO is initial, Paycom may be full middle name
-    if "employee middle initial" in fname:
-        if uz_blank and not pc_blank:
-            return "UZIO_MISSING_VALUE"
-        if pc_blank and not uz_blank:
-            return "PAYCOM_MISSING_VALUE"
-        uz_first = to_str(uz_val)[:1].upper()
-        pc_first = to_str(pc_val)[:1].upper()
-        return "OK" if uz_first != "" and uz_first == pc_first else "MISMATCH"
+    if ("middle" in f) and ("initial" in f):
+        if normalize_middle_initial(uzio_val, paycom_val):
+            return True
+        return first_alpha_char(uzio_val) == first_alpha_char(paycom_val)
 
-    # Employee Suffix: Jr. == JR, etc
-    if "employee suffix" in fname:
-        if uz_blank and not pc_blank:
-            return "UZIO_MISSING_VALUE"
-        if pc_blank and not uz_blank:
-            return "PAYCOM_MISSING_VALUE"
-        return "OK" if norm_simple_text(uz_val) == norm_simple_text(pc_val) else "MISMATCH"
+    if "suffix" in f:
+        return normalize_suffix(uzio_val) == normalize_suffix(paycom_val)
 
-    # Employment Type: Full Time == Full-Time
-    if "employment type" in fname:
-        if uz_blank and not pc_blank:
-            return "UZIO_MISSING_VALUE"
-        if pc_blank and not uz_blank:
-            return "PAYCOM_MISSING_VALUE"
-        return "OK" if norm_simple_text(uz_val) == norm_simple_text(pc_val) else "MISMATCH"
+    # Date-ish fields (including DOH)
+    if any(k in f for k in ["date", "dob", "birth", "effective", "doh", "hire", "termination"]):
+        return try_parse_date(uzio_val) == try_parse_date(paycom_val)
 
-    # Employment Status: Paycom "On Leave" == UZIO "Active"
-    if fname == "employment status":
-        if pc_blank and not uz_blank:
-            return "PAYCOM_MISSING_VALUE"
-        if uz_blank and not pc_blank:
-            return "UZIO_MISSING_VALUE"
-        pc_norm = to_str(pc_val).casefold()
-        uz_norm = to_str(uz_val).casefold()
-        if pc_norm == "on leave" and uz_norm == "active":
-            return "OK"
-        return "OK" if uz_norm == pc_norm else "MISMATCH"
+    # Numeric-ish fields
+    if any(k in f for k in ["salary", "rate", "hours", "amount", "percent", "percentage", "digits"]):
+        fa = as_float_or_none(uzio_val)
+        fb = as_float_or_none(paycom_val)
+        if fa is not None and fb is not None:
+            return abs(fa - fb) <= 1e-9
+        return normalize_space_and_case(uzio_val) == normalize_space_and_case(paycom_val)
 
-    # Termination Reason:
-    # If both contain "voluntary" -> OK
-    # If both contain "involuntary" -> OK
-    # Else use mapping table (if exists)
-    if fname == "termination reason":
-        if uz_blank and not pc_blank:
-            return "UZIO_MISSING_VALUE"
-        if pc_blank and not uz_blank:
-            return "PAYCOM_MISSING_VALUE"
+    return normalize_space_and_case(uzio_val) == normalize_space_and_case(paycom_val)
 
-        uz_s = to_str(uz_val)
-        pc_s = to_str(pc_val)
-
-        if contains_word(uz_s, "voluntary") and contains_word(pc_s, "voluntary"):
-            return "OK"
-        if contains_word(uz_s, "involuntary") and contains_word(pc_s, "involuntary"):
-            return "OK"
-
-        term_map = value_maps.get("termination_reason_map", {})
-        mapped = term_map.get(pc_s.casefold(), "")
-        if mapped:
-            return "OK" if norm_simple_text(uz_s) == norm_simple_text(mapped) else "MISMATCH"
-
-        # fallback direct compare
-        return "OK" if norm_simple_text(uz_s) == norm_simple_text(pc_s) else "MISMATCH"
-
-    # Pay Type: Salaried == Salary
-    if fname == "pay type":
-        if uz_blank and not pc_blank:
-            return "UZIO_MISSING_VALUE"
-        if pc_blank and not uz_blank:
-            return "PAYCOM_MISSING_VALUE"
-        uz_norm = norm_simple_text(uz_val)
-        pc_norm = norm_simple_text(pc_val)
-        # map salary <-> salaried
-        if uz_norm == "salaried" and pc_norm == "salary":
-            return "OK"
-        if uz_norm == "salary" and pc_norm == "salaried":
-            return "OK"
-        return "OK" if uz_norm == pc_norm else "MISMATCH"
-
-    # If person is salaried then don't compare hourly rate + working hours/week
-    if "hourly pay rate" in fname or "working hours per week" in fname:
-        if contains_word(emp_pay_type, "salary") or contains_word(emp_pay_type, "salaried"):
-            return "OK"
-        # hourly employee -> normal compare (numeric)
-        if uz_blank and not pc_blank:
-            return "UZIO_MISSING_VALUE"
-        if pc_blank and not uz_blank:
-            return "PAYCOM_MISSING_VALUE"
-        # numeric compare (ignore decimals)
-        if num_equal(uz_val, pc_val):
-            return "OK"
-        # also allow text normalized compare
-        return "OK" if norm_simple_text(uz_val) == norm_simple_text(pc_val) else "MISMATCH"
-
-    # Annual Salary (Digits):
-    # - If employee is hourly and UZIO blank => OK (not UZIO_MISSING_VALUE)
-    if "annual salary" in fname:
-        if contains_word(emp_pay_type, "hourly"):
-            # UZIO should be blank; treat blank as OK even if Paycom has value
-            return "OK" if uz_blank else ("OK" if num_equal(uz_val, pc_val) else "MISMATCH")
-        # salaried -> compare numeric
-        if uz_blank and not pc_blank:
-            return "UZIO_MISSING_VALUE"
-        if pc_blank and not uz_blank:
-            return "PAYCOM_MISSING_VALUE"
-        return "OK" if num_equal(uz_val, pc_val) else "MISMATCH"
-
-    # Generic numeric equality: ignore decimals formatting
-    if num_equal(uz_val, pc_val):
-        return "OK"
-
-    # Generic string compare (case-insensitive, trim)
-    if norm_simple_text(uz_val) == norm_simple_text(pc_val):
-        return "OK"
-
-    # Missing (generic) if one side blank
-    if uz_blank and not pc_blank:
-        return "UZIO_MISSING_VALUE"
-    if pc_blank and not uz_blank:
-        return "PAYCOM_MISSING_VALUE"
-
-    return "MISMATCH"
-
-
-# =========================
-# MAIN RUN
-# =========================
-def run_audit(file_bytes: bytes) -> bytes:
+# ---------- Core comparison ----------
+def run_comparison(file_bytes: bytes) -> bytes:
     xls = pd.ExcelFile(io.BytesIO(file_bytes), engine="openpyxl")
 
-    uz_sheet = find_sheet_case_insensitive(xls, UZIO_SHEET_NAME)
-    pc_sheet = find_sheet_case_insensitive(xls, PAYCOM_SHEET_NAME)
-    mp_sheet = find_sheet_case_insensitive(xls, MAPPING_SHEET_NAME)
+    uzio_sheet = resolve_sheet_name(xls, UZIO_SHEET_CANDIDATES)
+    paycom_sheet = resolve_sheet_name(xls, PAYCOM_SHEET_CANDIDATES)
+    map_sheet = resolve_sheet_name(xls, MAP_SHEET_CANDIDATES)
 
-    uzio = pd.read_excel(xls, sheet_name=uz_sheet, dtype=object)
-    paycom = pd.read_excel(xls, sheet_name=pc_sheet, dtype=object)
-    mapping_df = pd.read_excel(xls, sheet_name=mp_sheet, dtype=object)
+    if uzio_sheet is None:
+        raise ValueError("UZIO sheet not found. Expected a tab like 'Uzio Data'.")
+    if paycom_sheet is None:
+        raise ValueError("Paycom sheet not found. Expected a tab like 'Paycom Data'.")
+    if map_sheet is None:
+        raise ValueError("Mapping sheet not found. Expected a tab like 'Mapping Sheet' or 'Mapping'.")
+
+    uzio = pd.read_excel(xls, sheet_name=uzio_sheet, dtype=object)
+    paycom = pd.read_excel(xls, sheet_name=paycom_sheet, dtype=object)
 
     uzio.columns = [norm_colname(c) for c in uzio.columns]
     paycom.columns = [norm_colname(c) for c in paycom.columns]
-    mapping_df.columns = [norm_colname(c) for c in mapping_df.columns]
 
-    # Key columns
-    uz_key = choose_key_column(uzio.columns, ["Employee", "Employee ID", "Employee_Code", "Employee Code"])
-    pc_key = choose_key_column(paycom.columns, ["Employee_Code", "Employee Code", "Employee", "Employee ID"])
+    # keys (robust)
+    UZIO_KEY = find_col(
+        uzio.columns,
+        "Employee ID", "EmployeeID", "Employee Id", "Employee",
+        "Employee_Code", "Employee Code"
+    )
+    if UZIO_KEY is None:
+        raise ValueError("UZIO key column not found (expected 'Employee ID'/'Employee'/'Employee_Code').")
 
-    if uz_key is None:
-        raise ValueError("UZIO key column not found (expected Employee / Employee ID / Employee_Code).")
-    if pc_key is None:
-        raise ValueError("Paycom key column not found (expected Employee_Code / Employee / Employee ID).")
+    PAYCOM_KEY = find_col(
+        paycom.columns,
+        "Employee_Code", "Employee Code",
+        "Employee ID", "EmployeeID", "Employee Id", "Employee"
+    )
+    if PAYCOM_KEY is None:
+        raise ValueError("Paycom key column not found (expected 'Employee_Code'/'Employee ID'/'Employee').")
 
-    uzio[uz_key] = norm_key_series(uzio[uz_key])
-    paycom[pc_key] = norm_key_series(paycom[pc_key])
+    # normalize keys
+    uzio[UZIO_KEY] = norm_key_series(uzio[UZIO_KEY])
+    paycom[PAYCOM_KEY] = norm_key_series(paycom[PAYCOM_KEY])
 
-    # Deduplicate keys by taking first record
-    uzio = uzio.drop_duplicates(subset=[uz_key], keep="first")
-    paycom = paycom.drop_duplicates(subset=[pc_key], keep="first")
+    # mapping sheet
+    mapping = read_mapping_sheet(xls, map_sheet, list(paycom.columns))
+    mapping = mapping[mapping["PAYCOM_Resolved_Column"] != ""].copy()
 
-    uz_by = uzio.set_index(uz_key, drop=False)
-    pc_by = paycom.set_index(pc_key, drop=False)
+    # employment status context map (prefer UZIO)
+    uzio_emp_status_col = find_col(uzio.columns, "Employment Status")
+    paycom_emp_status_col = find_col(paycom.columns, "Employment Status")
 
-    # Column mapping
-    col_map = read_column_mapping(mapping_df, uzio.columns, paycom.columns)
+    uzio_status_map = {}
+    if uzio_emp_status_col is not None:
+        tmp = uzio[[UZIO_KEY, uzio_emp_status_col]].copy()
+        tmp[uzio_emp_status_col] = tmp[uzio_emp_status_col].map(norm_blank)
+        tmp = tmp[tmp[UZIO_KEY] != ""]
+        for _, r in tmp.iterrows():
+            eid = str(r[UZIO_KEY]).strip()
+            v = r[uzio_emp_status_col]
+            if eid and norm_blank(v) != "" and eid not in uzio_status_map:
+                uzio_status_map[eid] = str(v)
 
-    # Optional value mappings
-    value_maps = {
-        "termination_reason_map": read_value_mapping_table(mapping_df, "Paycom Termination Reason", "Uzio Termination Reason")
-    }
+    paycom_status_map = {}
+    if paycom_emp_status_col is not None:
+        tmp = paycom[[PAYCOM_KEY, paycom_emp_status_col]].copy()
+        tmp[paycom_emp_status_col] = tmp[paycom_emp_status_col].map(norm_blank)
+        tmp = tmp[tmp[PAYCOM_KEY] != ""]
+        for _, r in tmp.iterrows():
+            eid = str(r[PAYCOM_KEY]).strip()
+            v = r[paycom_emp_status_col]
+            if eid and norm_blank(v) != "" and eid not in paycom_status_map:
+                paycom_status_map[eid] = str(v)
 
-    employees = sorted(set(uz_by.index) | set(pc_by.index))
+    def get_emp_status(eid: str) -> str:
+        eid = (eid or "").strip()
+        if eid in uzio_status_map:
+            return str(uzio_status_map[eid])
+        if eid in paycom_status_map:
+            return str(paycom_status_map[eid])
+        return ""
 
-    out_rows = []
+    # pay type map (prefer UZIO)
+    uzio_pay_type_col = find_col(uzio.columns, "Pay Type")
+    paycom_pay_type_col = find_col(paycom.columns, "Pay Type")
 
-    for emp in employees:
-        uz_row = uz_by.loc[emp] if emp in uz_by.index else None
-        pc_row = pc_by.loc[emp] if emp in pc_by.index else None
+    pay_type_map = {}
+    if uzio_pay_type_col is not None:
+        tmp = uzio[[UZIO_KEY, uzio_pay_type_col]].copy()
+        tmp[uzio_pay_type_col] = tmp[uzio_pay_type_col].map(norm_blank)
+        tmp = tmp[tmp[UZIO_KEY] != ""]
+        for _, r in tmp.iterrows():
+            eid = str(r[UZIO_KEY]).strip()
+            v = r[uzio_pay_type_col]
+            if eid and norm_blank(v) != "" and eid not in pay_type_map:
+                pay_type_map[eid] = canonical_pay_type(v)
 
-        # If multiple rows somehow, take first
-        if isinstance(uz_row, pd.DataFrame):
-            uz_row = uz_row.iloc[0]
-        if isinstance(pc_row, pd.DataFrame):
-            pc_row = pc_row.iloc[0]
+    if paycom_pay_type_col is not None:
+        tmp = paycom[[PAYCOM_KEY, paycom_pay_type_col]].copy()
+        tmp[paycom_pay_type_col] = tmp[paycom_pay_type_col].map(norm_blank)
+        tmp = tmp[tmp[PAYCOM_KEY] != ""]
+        for _, r in tmp.iterrows():
+            eid = str(r[PAYCOM_KEY]).strip()
+            v = r[paycom_pay_type_col]
+            if eid and norm_blank(v) != "" and eid not in pay_type_map:
+                pay_type_map[eid] = canonical_pay_type(v)
 
-        emp_status = to_str(uz_row.get("Employment Status", "")) if uz_row is not None else ""
-        emp_pay_type = to_str(uz_row.get("Pay Type", "")) if uz_row is not None else ""
+    # index maps (keep first occurrence per employee)
+    uzio_idx = {}
+    for i, eid in uzio[UZIO_KEY].items():
+        e = str(eid).strip()
+        if e and e not in uzio_idx:
+            uzio_idx[e] = i
 
-        for _, m in col_map.iterrows():
-            uz_field = to_str(m["UZIO Column"])
-            pc_col = to_str(m["PAYCOM_Resolved"])
+    paycom_idx = {}
+    for i, eid in paycom[PAYCOM_KEY].items():
+        e = str(eid).strip()
+        if e and e not in paycom_idx:
+            paycom_idx[e] = i
 
-            # Column missing checks
-            if uz_field not in uzio.columns:
-                status = "UZIO_COLUMN_MISSING"
-                uz_val = ""
-                pc_val = ""
-            elif pc_col == "" or pc_col not in paycom.columns:
+    all_emps = sorted(set(uzio_idx.keys()).union(set(paycom_idx.keys())))
+
+    rows = []
+    for eid in all_emps:
+        u_i = uzio_idx.get(eid)
+        p_i = paycom_idx.get(eid)
+
+        emp_status_context = get_emp_status(eid)
+        emp_pay_type = pay_type_map.get(eid, "")
+
+        for _, mr in mapping.iterrows():
+            uz_field = mr["UZIO_Column"]
+            pc_col = mr["PAYCOM_Resolved_Column"]
+
+            uz_missing_row = (u_i is None)
+            pc_missing_row = (p_i is None)
+
+            uz_missing_col = (uz_field not in uzio.columns)
+            pc_missing_col = (pc_col not in paycom.columns)
+
+            uz_val = ""
+            pc_val = ""
+            if (not uz_missing_row) and (not uz_missing_col):
+                uz_val = uzio.loc[u_i, uz_field]
+            if (not pc_missing_row) and (not pc_missing_col):
+                pc_val = paycom.loc[p_i, pc_col]
+
+            # Decide status
+            if pc_missing_row and (not uz_missing_row):
+                status = "MISSING_IN_PAYCOM"
+            elif uz_missing_row and (not pc_missing_row):
+                status = "MISSING_IN_UZIO"
+            elif pc_missing_col:
                 status = "PAYCOM_COLUMN_MISSING"
-                uz_val = to_str(uz_row.get(uz_field, "")) if uz_row is not None else ""
-                pc_val = ""
+            elif uz_missing_col:
+                status = "UZIO_COLUMN_MISSING"
             else:
-                uz_val = to_str(uz_row.get(uz_field, "")) if uz_row is not None else ""
-                pc_val = to_str(pc_row.get(pc_col, "")) if pc_row is not None else ""
-                status = compare_values(uz_field, uz_val, pc_val, emp_pay_type, value_maps)
+                # ✅ Pay-type based ignore rules (your latest requirement)
+                if should_ignore_field_for_paytype(uz_field, emp_pay_type):
+                    status = "OK"
+                else:
+                    same = normalized_compare(uz_field, uz_val, pc_val)
+                    if same:
+                        status = "OK"
+                    else:
+                        uz_b = norm_blank(uz_val)
+                        pc_b = norm_blank(pc_val)
+                        if (uz_b == "" or uz_b is None) and (pc_b != "" and pc_b is not None):
+                            status = "UZIO_MISSING_VALUE"
+                        elif (uz_b != "" and uz_b is not None) and (pc_b == "" or pc_b is None):
+                            status = "PAYCOM_MISSING_VALUE"
+                        else:
+                            status = "MISMATCH"
 
-            out_rows.append({
-                "Employee": emp,
-                "Field": uz_field,
-                "Employment Status": emp_status,
-                "UZIO_Value": uz_val,
-                "PAYCOM_Value": pc_val,
-                "PAYCOM_SourceOfTruth_Status": status
-            })
+            rows.append(
+                {
+                    "Employee": eid,
+                    "Field": uz_field,
+                    "Employment Status": emp_status_context,  # extra context column
+                    "UZIO_Value": uz_val,
+                    "PAYCOM_Value": pc_val,
+                    "PAYCOM_SourceOfTruth_Status": status,
+                }
+            )
 
-    detail_df = pd.DataFrame(out_rows)
-
-    # Summary
-    status_counts = detail_df["PAYCOM_SourceOfTruth_Status"].value_counts(dropna=False).to_dict()
-    summary_rows = [{"Metric": k, "Value": v} for k, v in status_counts.items()]
-    summary_rows.insert(0, {"Metric": "Total Rows Compared", "Value": len(detail_df)})
-    summary_df = pd.DataFrame(summary_rows)
-
-    # Field Summary by Status
-    field_summary_df = (
-        detail_df.groupby(["Field", "PAYCOM_SourceOfTruth_Status"])
-        .size()
-        .reset_index(name="Count")
-        .sort_values(["Field", "PAYCOM_SourceOfTruth_Status"])
+    comparison_detail = pd.DataFrame(
+        rows,
+        columns=[
+            "Employee",
+            "Field",
+            "Employment Status",
+            "UZIO_Value",
+            "PAYCOM_Value",
+            "PAYCOM_SourceOfTruth_Status",
+        ],
     )
 
-    # Write output excel
+    # Field summary
+    statuses = [
+        "OK",
+        "MISMATCH",
+        "UZIO_MISSING_VALUE",
+        "PAYCOM_MISSING_VALUE",
+        "MISSING_IN_UZIO",
+        "MISSING_IN_PAYCOM",
+        "PAYCOM_COLUMN_MISSING",
+        "UZIO_COLUMN_MISSING",
+    ]
+
+    if not comparison_detail.empty:
+        field_summary_by_status = (
+            comparison_detail.pivot_table(
+                index="Field",
+                columns="PAYCOM_SourceOfTruth_Status",
+                values="Employee",
+                aggfunc="count",
+                fill_value=0,
+            )
+            .reindex(columns=statuses, fill_value=0)
+            .reset_index()
+        )
+        field_summary_by_status["Total"] = field_summary_by_status[statuses].sum(axis=1)
+    else:
+        field_summary_by_status = pd.DataFrame(columns=["Field"] + statuses + ["Total"])
+
+    # Summary
+    uzio_emps = set(uzio[UZIO_KEY].dropna().map(str))
+    paycom_emps = set(paycom[PAYCOM_KEY].dropna().map(str))
+
+    summary = pd.DataFrame(
+        {
+            "Metric": [
+                "Total UZIO Employees",
+                "Total PAYCOM Employees",
+                "Employees in both",
+                "Employees only in UZIO",
+                "Employees only in PAYCOM",
+                "Total UZIO Records",
+                "Total PAYCOM Records",
+                "Fields Compared",
+                "Total Comparisons (field-level rows)",
+            ],
+            "Value": [
+                len(uzio_emps),
+                len(paycom_emps),
+                len(uzio_emps & paycom_emps),
+                len(uzio_emps - paycom_emps),
+                len(paycom_emps - uzio_emps),
+                int(len(uzio)),
+                int(len(paycom)),
+                int(mapping.shape[0]),
+                int(comparison_detail.shape[0]),
+            ],
+        }
+    )
+
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as writer:
-        summary_df.to_excel(writer, SUMMARY_SHEET, index=False)
-        field_summary_df.to_excel(writer, FIELD_SUMMARY_SHEET, index=False)
-        detail_df.to_excel(writer, DETAIL_SHEET, index=False)
+        summary.to_excel(writer, sheet_name="Summary", index=False)
+        field_summary_by_status.to_excel(writer, sheet_name="Field_Summary_By_Status", index=False)
+        comparison_detail.to_excel(writer, sheet_name="Comparison_Detail_AllFields", index=False)
 
     return out.getvalue()
 
+# ---------- UI ----------
+st.title(APP_TITLE)
+st.write("Upload the Excel workbook (.xlsx) with 3 tabs: Uzio Data, Paycom Data, and Mapping Sheet.")
 
-# =========================
-# STREAMLIT APP
-# =========================
-uploaded = st.file_uploader("Upload Excel workbook", type=["xlsx"])
+uploaded_file = st.file_uploader("Upload Excel workbook", type=["xlsx"])
+run_btn = st.button("Run Audit", type="primary", disabled=(uploaded_file is None))
 
-if st.button("Run Audit", disabled=(uploaded is None)):
+if run_btn:
     try:
-        report_bytes = run_audit(uploaded.getvalue())
-        filename = f"UZIO_vs_PAYCOM_Comparison_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
-        st.success("Audit completed.")
+        with st.spinner("Running audit..."):
+            report_bytes = run_comparison(uploaded_file.getvalue())
+
+        st.success("Report generated.")
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_name = f"UZIO_vs_PAYCOM_Comparison_Report_PAYCOM_SourceOfTruth_{ts}.xlsx"
+
         st.download_button(
-            "Download Report",
+            label="Download Report (.xlsx)",
             data=report_bytes,
-            file_name=filename,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            file_name=out_name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
         )
     except Exception as e:
         st.error(f"Failed: {e}")
