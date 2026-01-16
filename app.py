@@ -149,6 +149,17 @@ def normalize_suffix(x):
     s = re.sub(r"[^a-z0-9]", "", s)  # remove punctuation/spaces
     return s
 
+def normalize_phone(x):
+    s = norm_blank(x)
+    if s == "":
+        return ""
+    # remove all non-digits
+    digits = re.sub(r"[^0-9]", "", str(s))
+    # if 11 digits and starts with 1, remove leading 1
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    return digits
+
 def first_alpha_char(x):
     s = norm_blank(x)
     if s == "":
@@ -326,6 +337,9 @@ def normalized_compare(field_name: str, uzio_val, paycom_val) -> bool:
 
     if "suffix" in f:
         return normalize_suffix(uzio_val) == normalize_suffix(paycom_val)
+
+    if "phone" in f:
+        return normalize_phone(uzio_val) == normalize_phone(paycom_val)
 
     # Date-ish fields (including DOH)
     if any(k in f for k in ["date", "dob", "birth", "effective", "doh", "hire", "termination"]):
