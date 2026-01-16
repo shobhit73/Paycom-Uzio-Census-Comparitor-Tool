@@ -19,17 +19,22 @@ import streamlit as st
 #   - Field_Summary_By_Status
 #   - Comparison_Detail_AllFields
 #
-# Key fixes included:
-#   1) Date fields like Original DOH compare as dates (ignore time part)
-#   2) Termination Reason: "voluntary"/"involuntary" keyword match => OK, and UZIO="Other" => OK
-#   3) Pay Type: UZIO "Salaried" == Paycom "Salary" => OK
-#   4) If Pay Type is Hourly => ignore Annual Salary comparison (treat as OK)
-#   5) If Pay Type is Salaried => ignore Hourly Rate comparison (treat as OK)
-#   6) Numeric fields: 150000.00 == 150000 and 80.0 == 80 => OK (tolerance-based)
-#   7) Employment Type: "Full Time" == "Full-Time" => OK
-#   8) Middle initial: UZIO first letter matches Paycom full middle name => OK
-#   9) Employment Status: Paycom "On Leave" is treated as "Active" (so not mismatch)
-#  10) Adds an extra output column "Employment Status" right after "Field"
+# Key rules included:
+#   ✅ Dates compare as DATE (ignore time part)
+#   ✅ Termination Reason: voluntary/involuntary keyword logic + UZIO=Other => OK
+#   ✅ Pay Type: UZIO "Salaried" == Paycom "Salary" => OK
+#   ✅ Suffix: Jr. == JR => OK
+#   ✅ Employment Type: Full Time == Full-Time => OK
+#   ✅ Middle initial: UZIO first letter matches Paycom full middle name => OK
+#   ✅ Employment Status: Paycom "On Leave" treated as "Active" => OK
+#   ✅ Numerics: 150000.00 == 150000, 80.0 == 80 => OK (tolerance compare)
+#
+# Pay Type driven ignores (IMPORTANT):
+#   ✅ If employee is HOURLY: ignore Annual Salary fields (UZIO blank is OK)
+#   ✅ If employee is SALARIED: ignore Hourly Pay Rate AND Working Hours per Week
+#      (UZIO leaves these blank => should be OK, not UZIO_MISSING_VALUE)
+#
+# Adds extra output column: "Employment Status" right after "Field"
 # =========================================================
 
 APP_TITLE = "Paycom Uzio Census Audit Tool"
@@ -91,24 +96,6 @@ def norm_key_series(s: pd.Series) -> pd.Series:
         return v
     return s2.map(_fix)
 
-def digits_only(x):
-    x = norm_blank(x)
-    if x == "":
-        return ""
-    try:
-        if isinstance(x, (int, np.integer)):
-            return str(int(x))
-        if isinstance(x, (float, np.floating)):
-            if float(x).is_integer():
-                return str(int(x))
-    except Exception:
-        pass
-
-    s = str(x).strip()
-    if re.fullmatch(r"\d+\.0+", s):
-        s = s.split(".")[0]
-    return re.sub(r"\D", "", s)
-
 def try_parse_date(x):
     x = norm_blank(x)
     if x == "":
@@ -117,7 +104,6 @@ def try_parse_date(x):
         return pd.to_datetime(x).date().isoformat()
     if isinstance(x, str):
         s = x.strip()
-        # If it looks like a datetime string, parse and return date
         try:
             return pd.to_datetime(s, errors="raise").date().isoformat()
         except Exception:
@@ -143,17 +129,6 @@ def as_float_or_none(x):
             return None
     return None
 
-def numeric_equal(a, b, tol=1e-9):
-    """
-    Compare numeric values safely:
-      80.0 == 80, 150000.00 == 150000
-    """
-    fa = as_float_or_none(a)
-    fb = as_float_or_none(b)
-    if fa is None or fb is None:
-        return False
-    return abs(fa - fb) <= tol
-
 def normalize_space_and_case(x):
     x = norm_blank(x)
     if x == "":
@@ -164,14 +139,12 @@ def normalize_space_and_case(x):
     return s.casefold()
 
 def normalize_employment_type(x):
-    # Full Time == Full-Time
     s = normalize_space_and_case(x)
     s = s.replace("-", " ")
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
 def normalize_suffix(x):
-    # Jr. == JR
     s = normalize_space_and_case(x)
     s = re.sub(r"[^a-z0-9]", "", s)  # remove punctuation/spaces
     return s
@@ -187,7 +160,7 @@ def first_alpha_char(x):
 def normalize_middle_initial(uzio_val, paycom_val):
     # UZIO has 'M', Paycom has 'MICHELLE' => OK if first letter matches
     u = first_alpha_char(uzio_val)
-    p = first_alpha_char(paycom_val)  # first alpha of full name
+    p = first_alpha_char(paycom_val)
     return u != "" and p != "" and u == p
 
 def canonical_pay_type(x):
@@ -196,15 +169,12 @@ def canonical_pay_type(x):
         return ""
     if "hour" in s:
         return "hourly"
-    # Paycom might say Salary, UZIO might say Salaried
     if "salar" in s or "salary" in s:
         return "salaried"
     return s
 
 def canonical_employment_status(x):
-    """
-    Paycom "On Leave" should be treated as Active in UZIO.
-    """
+    # Paycom "On Leave" treated as "Active"
     s = normalize_space_and_case(x)
     if s == "":
         return ""
@@ -217,27 +187,26 @@ def canonical_employment_status(x):
 def termination_reason_equal(uzio_val, paycom_val):
     uz = normalize_space_and_case(uzio_val)
     pc = normalize_space_and_case(paycom_val)
+
     if uz == "" and pc == "":
         return True
 
-    # If UZIO is "Other", treat it as acceptable for any Paycom reason
+    # UZIO "Other" is acceptable for any Paycom reason
     if uz == "other":
         return True
 
-    # If both contain "involuntary" anywhere => OK
+    # If either has involuntary, both must have involuntary
     if ("involuntary" in uz) or ("involuntary" in pc):
         return ("involuntary" in uz) and ("involuntary" in pc)
 
-    # If both contain "voluntary" anywhere => OK
+    # If either has voluntary, both must have voluntary
     if ("voluntary" in uz) or ("voluntary" in pc):
         return ("voluntary" in uz) and ("voluntary" in pc)
 
-    # otherwise strict normalized compare
     return uz == pc
 
 def resolve_sheet_name(xls: pd.ExcelFile, candidates):
-    existing = xls.sheet_names
-    existing_norm = {norm_colname(s).casefold(): s for s in existing}
+    existing_norm = {norm_colname(s).casefold(): s for s in xls.sheet_names}
     for c in candidates:
         k = norm_colname(c).casefold()
         if k in existing_norm:
@@ -245,9 +214,6 @@ def resolve_sheet_name(xls: pd.ExcelFile, candidates):
     return None
 
 def resolve_paycom_col_label(label: str, paycom_cols_all) -> str:
-    """
-    Mapping sheet can have noisy values; resolve to actual Paycom column names.
-    """
     if label is None:
         return ""
     raw = str(label).strip()
@@ -307,7 +273,7 @@ def read_mapping_sheet(xls: pd.ExcelFile, sheet_name: str, paycom_cols_all: list
     m["PAYCOM_Label"] = m[pc_col_name]
     m["PAYCOM_Resolved_Column"] = m["PAYCOM_Label"].map(lambda x: resolve_paycom_col_label(x, paycom_cols_all))
 
-    # exclude Employee ID (or Employee) from comparisons (it is only key)
+    # exclude Employee ID/Employee Code from comparisons (key only)
     m["_uz_norm"] = m["UZIO_Column"].map(lambda x: norm_colname(x).casefold())
     m = m[~m["_uz_norm"].isin({"employee id", "employee", "employee_code", "employee code"})].copy()
     m.drop(columns=["_uz_norm"], inplace=True)
@@ -315,46 +281,49 @@ def read_mapping_sheet(xls: pd.ExcelFile, sheet_name: str, paycom_cols_all: list
     return m
 
 def should_ignore_field_for_paytype(field_name: str, pay_type_canon: str) -> bool:
+    """
+    Pay-type based ignore rules (as per your requirement):
+      - HOURLY employees: ignore annual salary fields
+      - SALARIED employees: ignore hourly pay rate AND working hours per week
+    """
     f = norm_colname(field_name).casefold()
     pt = (pay_type_canon or "").casefold()
 
-    # If hourly => do NOT compare annual salary
-    if pt == "hourly" and ("annual salary" in f):
-        return True
+    if pt == "hourly":
+        if "annual salary" in f:
+            return True
 
-    # If salaried => do NOT compare hourly rate
-    if pt == "salaried" and ("hourly rate" in f):
-        return True
+    if pt == "salaried":
+        # ignore Hourly Pay Rate (covers: "Hourly Pay Rate", "Hourly Rate", etc.)
+        if ("hourly" in f and "rate" in f):
+            return True
+
+        # ignore Working Hours per Week (covers: "Working Hours per Week(Digits)", "Hours per Week", etc.)
+        if ("hours per week" in f) or ("working hours" in f):
+            return True
 
     return False
 
 def normalized_compare(field_name: str, uzio_val, paycom_val) -> bool:
     f = norm_colname(field_name).casefold()
 
-    # Termination Reason special rule
     if "termination reason" in f:
         return termination_reason_equal(uzio_val, paycom_val)
 
-    # Employment Status special rule (On Leave treated as Active)
     if "employment status" in f:
         return canonical_employment_status(uzio_val) == canonical_employment_status(paycom_val)
 
-    # Pay Type: Salaried == Salary
     if "pay type" in f:
         return canonical_pay_type(uzio_val) == canonical_pay_type(paycom_val)
 
-    # Employment Type: Full Time == Full-Time
     if "employment type" in f:
         return normalize_employment_type(uzio_val) == normalize_employment_type(paycom_val)
 
-    # Middle Initial: compare first letter
     if ("middle" in f) and ("initial" in f):
         if normalize_middle_initial(uzio_val, paycom_val):
             return True
-        # fallback strict
         return first_alpha_char(uzio_val) == first_alpha_char(paycom_val)
 
-    # Suffix: Jr. == JR
     if "suffix" in f:
         return normalize_suffix(uzio_val) == normalize_suffix(paycom_val)
 
@@ -364,15 +333,12 @@ def normalized_compare(field_name: str, uzio_val, paycom_val) -> bool:
 
     # Numeric-ish fields
     if any(k in f for k in ["salary", "rate", "hours", "amount", "percent", "percentage", "digits"]):
-        # if both numeric-like, compare numerically with tolerance
         fa = as_float_or_none(uzio_val)
         fb = as_float_or_none(paycom_val)
         if fa is not None and fb is not None:
             return abs(fa - fb) <= 1e-9
-        # if not numeric, fallback to string normalization
         return normalize_space_and_case(uzio_val) == normalize_space_and_case(paycom_val)
 
-    # Default string compare (casefold + whitespace collapse)
     return normalize_space_and_case(uzio_val) == normalize_space_and_case(paycom_val)
 
 # ---------- Core comparison ----------
@@ -418,11 +384,10 @@ def run_comparison(file_bytes: bytes) -> bytes:
     paycom[PAYCOM_KEY] = norm_key_series(paycom[PAYCOM_KEY])
 
     # mapping sheet
-    paycom_cols_all = list(paycom.columns)
-    mapping = read_mapping_sheet(xls, map_sheet, paycom_cols_all)
+    mapping = read_mapping_sheet(xls, map_sheet, list(paycom.columns))
     mapping = mapping[mapping["PAYCOM_Resolved_Column"] != ""].copy()
 
-    # build "employment status" context map (prefer UZIO)
+    # employment status context map (prefer UZIO)
     uzio_emp_status_col = find_col(uzio.columns, "Employment Status")
     paycom_emp_status_col = find_col(paycom.columns, "Employment Status")
 
@@ -456,7 +421,7 @@ def run_comparison(file_bytes: bytes) -> bytes:
             return str(paycom_status_map[eid])
         return ""
 
-    # build pay type map (prefer UZIO)
+    # pay type map (prefer UZIO)
     uzio_pay_type_col = find_col(uzio.columns, "Pay Type")
     paycom_pay_type_col = find_col(paycom.columns, "Pay Type")
 
@@ -481,7 +446,7 @@ def run_comparison(file_bytes: bytes) -> bytes:
             if eid and norm_blank(v) != "" and eid not in pay_type_map:
                 pay_type_map[eid] = canonical_pay_type(v)
 
-    # index maps (handle possible duplicates: keep first)
+    # index maps (keep first occurrence per employee)
     uzio_idx = {}
     for i, eid in uzio[UZIO_KEY].items():
         e = str(eid).strip()
@@ -531,37 +496,28 @@ def run_comparison(file_bytes: bytes) -> bytes:
             elif uz_missing_col:
                 status = "UZIO_COLUMN_MISSING"
             else:
-                # Ignore rules based on Pay Type
+                # ✅ Pay-type based ignore rules (your latest requirement)
                 if should_ignore_field_for_paytype(uz_field, emp_pay_type):
                     status = "OK"
                 else:
-                    # If hourly: annual salary can be blank in UZIO (treat as OK)
-                    f_l = norm_colname(uz_field).casefold()
-                    if emp_pay_type == "hourly" and "annual salary" in f_l:
-                        status = "OK"
-                    # If salaried: hourly rate should be ignored (treat as OK)
-                    elif emp_pay_type == "salaried" and "hourly rate" in f_l:
+                    same = normalized_compare(uz_field, uz_val, pc_val)
+                    if same:
                         status = "OK"
                     else:
-                        # Normal comparison
-                        same = normalized_compare(uz_field, uz_val, pc_val)
-                        if same:
-                            status = "OK"
+                        uz_b = norm_blank(uz_val)
+                        pc_b = norm_blank(pc_val)
+                        if (uz_b == "" or uz_b is None) and (pc_b != "" and pc_b is not None):
+                            status = "UZIO_MISSING_VALUE"
+                        elif (uz_b != "" and uz_b is not None) and (pc_b == "" or pc_b is None):
+                            status = "PAYCOM_MISSING_VALUE"
                         else:
-                            uz_b = norm_blank(uz_val)
-                            pc_b = norm_blank(pc_val)
-                            if (uz_b == "" or uz_b is None) and (pc_b != "" and pc_b is not None):
-                                status = "UZIO_MISSING_VALUE"
-                            elif (uz_b != "" and uz_b is not None) and (pc_b == "" or pc_b is None):
-                                status = "PAYCOM_MISSING_VALUE"
-                            else:
-                                status = "MISMATCH"
+                            status = "MISMATCH"
 
             rows.append(
                 {
                     "Employee": eid,
                     "Field": uz_field,
-                    "Employment Status": emp_status_context,  # <-- extra context column
+                    "Employment Status": emp_status_context,  # extra context column
                     "UZIO_Value": uz_val,
                     "PAYCOM_Value": pc_val,
                     "PAYCOM_SourceOfTruth_Status": status,
