@@ -338,8 +338,23 @@ def normalized_compare(field_name: str, uzio_val, paycom_val) -> bool:
     if "suffix" in f:
         return normalize_suffix(uzio_val) == normalize_suffix(paycom_val)
 
+    if "ssn" in f:
+        # Normalize SSN: digits only, remove leading zeros
+        u = re.sub(r"\D", "", str(uzio_val)).lstrip("0")
+        p = re.sub(r"\D", "", str(paycom_val)).lstrip("0")
+        return u == p
+
     if "phone" in f:
-        return normalize_phone(uzio_val) == normalize_phone(paycom_val)
+        # Normalize Phone: digits only, remove leading zeros
+        u = normalize_phone(uzio_val).lstrip("0")
+        p = normalize_phone(paycom_val).lstrip("0")
+        return u == p
+
+    if "zip" in f:
+        # Normalize Zip: digits only (simple), remove leading zeros
+        u = re.sub(r"\D", "", str(uzio_val)).lstrip("0")
+        p = re.sub(r"\D", "", str(paycom_val)).lstrip("0")
+        return u == p
 
     # Date-ish fields (including DOH)
     if any(k in f for k in ["date", "dob", "birth", "effective", "doh", "hire", "termination"]):
