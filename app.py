@@ -645,8 +645,9 @@ if run_btn:
             report_bytes = run_comparison(uploaded_file.getvalue())
 
         st.success("Report generated.")
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_name = f"UZIO_vs_PAYCOM_Comparison_Report_PAYCOM_SourceOfTruth_{ts}.xlsx"
+        # requested format: Client_Name_Paycom_Census_Data_Audit_<Current Date>
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        out_name = f"Client_Name_Paycom_Census_Data_Audit_{today_str}.xlsx"
 
         st.download_button(
             label="Download Report (.xlsx)",
