@@ -517,30 +517,30 @@ def run_comparison(file_bytes: bytes) -> bytes:
 
             # Decide status
             if pc_missing_row and (not uz_missing_row):
-                status = "MISSING_IN_PAYCOM"
+                status = "Employee ID Not Found in Paycom"
             elif uz_missing_row and (not pc_missing_row):
-                status = "MISSING_IN_UZIO"
+                status = "Employee ID Not Found in Uzio"
             elif pc_missing_col:
-                status = "PAYCOM_COLUMN_MISSING"
+                status = "Column Missing in Paycom Sheet"
             elif uz_missing_col:
-                status = "UZIO_COLUMN_MISSING"
+                status = "Column Missing in Uzio Sheet"
             else:
                 # ✅ Pay-type based ignore rules (your latest requirement)
                 if should_ignore_field_for_paytype(uz_field, emp_pay_type):
-                    status = "OK"
+                    status = "Data Match"
                 else:
                     same = normalized_compare(uz_field, uz_val, pc_val)
                     if same:
-                        status = "OK"
+                        status = "Data Match"
                     else:
                         uz_b = norm_blank(uz_val)
                         pc_b = norm_blank(pc_val)
                         if (uz_b == "" or uz_b is None) and (pc_b != "" and pc_b is not None):
-                            status = "UZIO_MISSING_VALUE"
+                            status = "Missing in Uzio (Paycom has value)"
                         elif (uz_b != "" and uz_b is not None) and (pc_b == "" or pc_b is None):
-                            status = "PAYCOM_MISSING_VALUE"
+                            status = "Missing in Paycom (Uzio has value)"
                         else:
-                            status = "MISMATCH"
+                            status = "Data Mismatch"
 
             rows.append(
                 {
@@ -567,14 +567,14 @@ def run_comparison(file_bytes: bytes) -> bytes:
 
     # Field summary
     statuses = [
-        "OK",
-        "MISMATCH",
-        "UZIO_MISSING_VALUE",
-        "PAYCOM_MISSING_VALUE",
-        "MISSING_IN_UZIO",
-        "MISSING_IN_PAYCOM",
-        "PAYCOM_COLUMN_MISSING",
-        "UZIO_COLUMN_MISSING",
+        "Data Match",
+        "Data Mismatch",
+        "Missing in Uzio (Paycom has value)",
+        "Missing in Paycom (Uzio has value)",
+        "Employee ID Not Found in Uzio",
+        "Employee ID Not Found in Paycom",
+        "Column Missing in Paycom Sheet",
+        "Column Missing in Uzio Sheet",
     ]
 
     if not comparison_detail.empty:
