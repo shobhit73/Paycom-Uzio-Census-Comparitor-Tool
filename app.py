@@ -536,9 +536,9 @@ def run_comparison(file_bytes: bytes) -> bytes:
                         uz_b = norm_blank(uz_val)
                         pc_b = norm_blank(pc_val)
                         if (uz_b == "" or uz_b is None) and (pc_b != "" and pc_b is not None):
-                            status = "Missing in Uzio (Paycom has value)"
+                            status = "Value missing in Uzio (Paycom has value)"
                         elif (uz_b != "" and uz_b is not None) and (pc_b == "" or pc_b is None):
-                            status = "Missing in Paycom (Uzio has value)"
+                            status = "Value missing in Paycom (Uzio has value)"
                         else:
                             status = "Data Mismatch"
 
@@ -569,8 +569,8 @@ def run_comparison(file_bytes: bytes) -> bytes:
     statuses = [
         "Data Match",
         "Data Mismatch",
-        "Missing in Uzio (Paycom has value)",
-        "Missing in Paycom (Uzio has value)",
+        "Value missing in Uzio (Paycom has value)",
+        "Value missing in Paycom (Uzio has value)",
         "Employee ID Not Found in Uzio",
         "Employee ID Not Found in Paycom",
         "Column Missing in Paycom Sheet",
